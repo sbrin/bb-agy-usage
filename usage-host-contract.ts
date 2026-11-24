@@ -1,6 +1,11 @@
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
+export const hostUsagePlan = z.object({
+  id: z.string().min(1),
+  multiplier: z.number().int().positive().nullable(),
+});
+
 export const hostUsageWindow = z.object({
   kind: z.enum(["five-hour", "weekly"]),
   label: z.string(),
@@ -12,6 +17,7 @@ export const hostUsageWindow = z.object({
 export const hostUsageState = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("ok"),
+    plan: hostUsagePlan.nullable().optional(),
     accountEmail: z.string().nullable(),
     planLabel: z.string().nullable(),
     windows: z.array(hostUsageWindow),

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeAgyUsage, parseKeyringPayload, readAgyUsage } from "./agy-usage.ts";
+import { normalizeAgyUsage, parseKeyringPayload, readAgyUsage, resolvePlanFromCodeAssist } from "./agy-usage.ts";
 
 test("parseKeyringPayload decodes go-keyring-base64 payload", () => {
   const payload = {
@@ -11,78 +11,101 @@ test("parseKeyringPayload decodes go-keyring-base64 payload", () => {
   assert.deepEqual(parseKeyringPayload(encoded), payload);
 });
 
-test("parseKeyringPayload decodes plain JSON payload", () => {
-  const payload = { token: { access_token: "tok-456" } };
-  assert.deepEqual(parseKeyringPayload(JSON.stringify(payload)), payload);
+test("resolvePlanFromCodeAssist extracts Pro, Ultra, and Free tiers", () => {
+  assert.deepEqual(
+    resolvePlanFromCodeAssist({
+      currentTier: { id: "free-tier", name: "Antigravity" },
+      paidTier: { id: "g1-pro-tier", name: "Google AI Pro" },
+    }),
+    { plan: { id: "pro", multiplier: null }, planLabel: "Pro" },
+  );
+  assert.deepEqual(
+    resolvePlanFromCodeAssist({
+      paidTier: { id: "g1-ultra-tier", name: "Google AI Ultra" },
+    }),
+    { plan: null, planLabel: "Ultra" },
+  );
+  assert.deepEqual(
+    resolvePlanFromCodeAssist({
+      currentTier: { id: "free-tier", name: "Antigravity" },
+    }),
+    { plan: { id: "free", multiplier: null }, planLabel: "Free" },
+  );
 });
 
-test("normalizeAgyUsage maps 5h and weekly buckets", () => {
+test("normalizeAgyUsage extracts live Gemini 5h quota and ignores 3p Claude/GPT buckets", () => {
   const result = normalizeAgyUsage({
-    groups: [
-      {
-        displayName: "Claude and GPT models",
-        buckets: [
-          {
-            bucketId: "3p-weekly",
-            displayName: "Weekly Limit Remaining",
-            window: "weekly",
-            resetTime: "2026-12-01T10:00:00Z",
-            remainingFraction: 0.75,
-          },
-          {
-            bucketId: "3p-5h",
-            displayName: "Five Hour Limit Remaining",
-            window: "5h",
-            resetTime: "2026-11-24T15:00:00Z",
-            remainingFraction: 0.4,
-          },
-        ],
-      },
-    ],
-  }, "user@example.com");
+    quota: {
+      buckets: [
+        { modelId: "claude-opus-5-5-high", remainingFraction: 1, resetTime: "2026-11-24T16:00:00Z" },
+        { modelId: "gemini-2.5-pro", remainingFraction: 0.83, resetTime: "2026-11-24T15:11:57Z" },
+        { modelId: "gemini-3-flash", remainingFraction: 0.85, resetTime: "2026-11-24T15:11:57Z" },
+      ],
+    },
+    summary: {
+      groups: [
+        {
+          displayName: "Claude and GPT models",
+          buckets: [
+            { bucketId: "3p-weekly", window: "weekly", remainingFraction: 1, resetTime: "2026-12-01T10:00:00Z" },
+          ],
+        },
+      ],
+    },
+    codeAssist: {
+      paidTier: { id: "g1-pro-tier", name: "Google AI Pro" },
+    },
+    email: "user@example.com",
+  });
 
   assert.equal(result.supported, true);
   assert.equal(result.usage.status, "ok");
   if (result.usage.status === "ok") {
     assert.equal(result.usage.accountEmail, "user@example.com");
-    assert.equal(result.usage.planLabel, "AGY");
+    assert.deepEqual(result.usage.plan, { id: "pro", multiplier: null });
+    assert.equal(result.usage.planLabel, "Pro");
     assert.deepEqual(result.usage.windows, [
       {
-        kind: "weekly",
-        label: "Weekly limit (Claude & GPT)",
-        usedPercent: 25,
-        resetsAt: "2026-12-01T10:00:00Z",
-      },
-      {
         kind: "five-hour",
-        label: "5-hour limit (Claude & GPT)",
-        usedPercent: 60,
-        resetsAt: "2026-11-24T15:00:00Z",
+        label: "Five-hour limit",
+        usedPercent: 17,
+        resetsAt: "2026-11-24T15:11:57Z",
       },
     ]);
   }
 });
 
-test("readAgyUsage falls back to keyring when token files are missing", async () => {
+test("readAgyUsage falls back to keyring and queries loadCodeAssist + retrieveUserQuota", async () => {
   const result = await readAgyUsage({
-    tokenPaths: ["/nonexistent/path/one", "/nonexistent/path/two"],
+    tokenPaths: ["/nonexistent/path/one"],
     readKeyring: async () => ({
       token: { access_token: "keyring-token", expiry: "2099-01-01T00:00:00Z" },
       id_token_email: "keyring@example.com",
     }),
-    fetcher: async () => new Response(JSON.stringify({
-      groups: [
-        {
-          displayName: "Gemini models",
-          buckets: [{ window: "weekly", remainingFraction: 0.9, resetTime: "2026-12-01T00:00:00Z" }],
-        },
-      ],
-    }), { status: 200 }),
+    fetcher: async (input) => {
+      const url = String(input);
+      if (url.includes(":loadCodeAssist")) {
+        return new Response(JSON.stringify({
+          cloudaicompanionProject: "aicode-consumers",
+          paidTier: { id: "g1-pro-tier", name: "Google AI Pro" },
+        }), { status: 200 });
+      }
+      if (url.includes(":retrieveUserQuotaSummary")) {
+        return new Response(JSON.stringify({ groups: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        buckets: [
+          { modelId: "gemini-2.5-pro", remainingFraction: 0.72, resetTime: "2026-11-24T15:00:00Z" },
+        ],
+      }), { status: 200 });
+    },
   });
 
   assert.equal(result.usage.status, "ok");
   if (result.usage.status === "ok") {
     assert.equal(result.usage.accountEmail, "keyring@example.com");
-    assert.equal(result.usage.windows[0]?.usedPercent, 10);
+    assert.equal(result.usage.planLabel, "Pro");
+    assert.equal(result.usage.windows[0]?.kind, "five-hour");
+    assert.equal(result.usage.windows[0]?.usedPercent, 28);
   }
 });

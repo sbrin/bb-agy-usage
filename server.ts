@@ -1,6 +1,6 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { usageHostContract } from "./usage-host-contract.js";
+import { hostUsagePlan, usageHostContract } from "./usage-host-contract.js";
 
 const PROVIDER_ID = "acp-agy";
 const LIST_RESOURCES = "provider-usage.v1.listResources";
@@ -9,7 +9,7 @@ const GET_RESOURCE = "provider-usage.v1.getResource";
 const usageState = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("ok"),
-    plan: z.null(),
+    plan: hostUsagePlan.nullable(),
     accountEmail: z.string().nullable(),
     planLabel: z.string().nullable(),
     windows: z.array(z.object({
@@ -81,7 +81,7 @@ export default function plugin(bb: BbPluginApi): void {
           ...base,
           usage: {
             status: "ok" as const,
-            plan: null,
+            plan: state.plan ?? null,
             accountEmail: state.accountEmail,
             planLabel: state.planLabel,
             windows: state.windows.map((window, index) => ({
@@ -90,11 +90,7 @@ export default function plugin(bb: BbPluginApi): void {
               label: window.label,
               usedPercent: window.usedPercent,
               resetsAt: window.resetsAt,
-              model: window.label.includes("Gemini")
-                ? "Gemini"
-                : window.label.includes("Claude")
-                  ? "Claude & GPT"
-                  : null,
+              model: null,
               cost: null,
             })),
           },
@@ -117,5 +113,5 @@ export default function plugin(bb: BbPluginApi): void {
         usage: { status: state.status, plan: null, accountEmail: null, planLabel: null },
       };
     },
-  }, { experimental_discoverable: true, experimental_description: "Adds AGY quota windows to BB Provider Usage." });
+  }, { experimental_discoverable: true, experimental_description: "Adds AGY Gemini quota windows to BB Provider Usage." });
 }

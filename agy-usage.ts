@@ -2,13 +2,14 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const DEFAULT_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-const FALLBACK_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const DEFAULT_API_BASE = "https://daily-cloudcode-pa.googleapis.com";
+const FALLBACK_API_BASE = "https://cloudcode-pa.googleapis.com";
+const DEFAULT_PROJECT = "aicode-consumers";
 const REFRESH_URL = "https://oauth2.googleapis.com/token";
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 // Google requires a client secret to exchange a refresh token. Never embed one
 // from the AGY client in a distributable plugin.
-const USER_AGENT = "Antigravity/1.2.11";
+const USER_AGENT = "Antigravity/1.5.15";
 
 const KEYRING_SERVICE = "gemini";
 const KEYRING_ACCOUNT = "antigravity";
@@ -21,7 +22,29 @@ export interface StoredToken {
   id_token_email?: string;
 }
 
-export interface QuotaBucket {
+export interface TierInfo {
+  id?: string;
+  name?: string;
+}
+
+export interface LoadCodeAssistResponse {
+  currentTier?: TierInfo;
+  paidTier?: TierInfo;
+  cloudaicompanionProject?: string | { id?: string };
+}
+
+export interface ModelQuotaBucket {
+  modelId?: string;
+  remainingFraction?: number;
+  resetTime?: string;
+  tokenType?: string;
+}
+
+export interface UserQuotaResponse {
+  buckets?: ModelQuotaBucket[];
+}
+
+export interface QuotaSummaryBucket {
   bucketId?: string;
   displayName?: string;
   window?: string;
@@ -29,13 +52,18 @@ export interface QuotaBucket {
   resetTime?: string;
 }
 
-export interface QuotaGroup {
+export interface QuotaSummaryGroup {
   displayName?: string;
-  buckets?: QuotaBucket[];
+  buckets?: QuotaSummaryBucket[];
 }
 
-export interface QuotaSummary {
-  groups?: QuotaGroup[];
+export interface QuotaSummaryResponse {
+  groups?: QuotaSummaryGroup[];
+}
+
+export interface AgyUsagePlan {
+  id: string;
+  multiplier: number | null;
 }
 
 export interface AgyUsageWindow {
@@ -48,6 +76,7 @@ export interface AgyUsageWindow {
 export type AgyUsageState =
   | {
     status: "ok";
+    plan: AgyUsagePlan | null;
     accountEmail: string | null;
     planLabel: string | null;
     windows: AgyUsageWindow[];
@@ -107,10 +136,6 @@ async function readStoredTokenFromMacosKeychain(): Promise<StoredToken | null> {
   }
 }
 
-/**
- * On Windows, agy stores its OAuth token in the Windows Credential Manager
- * (keyring) rather than a plain JSON file.
- */
 async function readStoredTokenFromWindowsKeyring(): Promise<StoredToken | null> {
   if (process.platform !== "win32") return null;
   try {
@@ -208,71 +233,154 @@ function accountEmail(stored: StoredToken): string | null {
   }
 }
 
-function resolveWindowKind(bucket: QuotaBucket): "five-hour" | "weekly" {
-  const windowHint = `${bucket.window ?? ""} ${bucket.bucketId ?? ""} ${bucket.displayName ?? ""}`;
-  if (/\b5h\b|five[- ]?hour/iu.test(windowHint)) {
-    return "five-hour";
+export function resolvePlanFromCodeAssist(
+  lca: LoadCodeAssistResponse | null,
+): { plan: AgyUsagePlan | null; planLabel: string | null } {
+  const tier = lca?.paidTier ?? lca?.currentTier;
+  if (!tier) return { plan: null, planLabel: null };
+  const hint = `${tier.id ?? ""} ${tier.name ?? ""}`;
+  if (/\bultra\b/iu.test(hint)) {
+    return { plan: null, planLabel: "Ultra" };
   }
+  if (/\bpro\b/iu.test(hint)) {
+    return { plan: { id: "pro", multiplier: null }, planLabel: "Pro" };
+  }
+  if (/\benterprise\b/iu.test(hint)) {
+    return { plan: { id: "enterprise", multiplier: null }, planLabel: "Enterprise" };
+  }
+  if (/\bstandard\b|\bteam\b/iu.test(hint)) {
+    return { plan: { id: "team", multiplier: null }, planLabel: "Team" };
+  }
+  if (/\bfree\b/iu.test(hint)) {
+    return { plan: { id: "free", multiplier: null }, planLabel: "Free" };
+  }
+  return { plan: null, planLabel: tier.name?.trim() || null };
+}
+
+function resolveProjectId(lca: LoadCodeAssistResponse | null): string {
+  const proj = lca?.cloudaicompanionProject;
+  if (typeof proj === "string" && proj.trim().length > 0) return proj.trim();
+  if (proj && typeof proj === "object" && typeof proj.id === "string" && proj.id.trim().length > 0) {
+    return proj.id.trim();
+  }
+  return DEFAULT_PROJECT;
+}
+
+function clampUsedPercent(remainingFraction: number | undefined): number {
+  const remaining = Number.isFinite(remainingFraction) ? remainingFraction! : 1;
+  return Math.max(0, Math.min(100, Math.round((1 - remaining) * 100)));
+}
+
+function resolveSummaryBucketKind(bucket: QuotaSummaryBucket): "five-hour" | "weekly" {
+  const hint = `${bucket.window ?? ""} ${bucket.bucketId ?? ""} ${bucket.displayName ?? ""}`;
+  if (/\b5h\b|five[- ]?hour/iu.test(hint)) return "five-hour";
   return "weekly";
 }
 
-export function normalizeAgyUsage(summary: QuotaSummary, email: string | null): AgyUsageResult {
-  const windows: AgyUsageWindow[] = (summary.groups ?? []).flatMap((group) => {
-    const name = group.displayName ?? "";
-    const groupSuffix = /gemini/iu.test(name)
-      ? " (Gemini)"
-      : /claude|gpt/iu.test(name)
-        ? " (Claude & GPT)"
-        : name
-          ? ` (${name})`
-          : "";
-    return (group.buckets ?? []).map((bucket) => {
-      const kind = resolveWindowKind(bucket);
-      const prefix = kind === "five-hour" ? "5-hour limit" : "Weekly limit";
-      const remaining = Number.isFinite(bucket.remainingFraction) ? bucket.remainingFraction! : 1;
-      return {
+export function normalizeAgyUsage(params: {
+  quota: UserQuotaResponse | null;
+  summary: QuotaSummaryResponse | null;
+  codeAssist: LoadCodeAssistResponse | null;
+  email: string | null;
+}): AgyUsageResult {
+  const { plan, planLabel } = resolvePlanFromCodeAssist(params.codeAssist);
+  let fiveHourWindow: AgyUsageWindow | null = null;
+  let weeklyWindow: AgyUsageWindow | null = null;
+
+  // 1. Live per-model Gemini quota from retrieveUserQuota (the primary 5-hour rolling window).
+  const geminiBuckets = (params.quota?.buckets ?? []).filter(
+    (bucket) => typeof bucket.modelId === "string" && /^gemini-/iu.test(bucket.modelId),
+  );
+  if (geminiBuckets.length > 0) {
+    let minRemaining = 1;
+    let earliestReset: string | null = null;
+    for (const bucket of geminiBuckets) {
+      if (Number.isFinite(bucket.remainingFraction) && bucket.remainingFraction! < minRemaining) {
+        minRemaining = bucket.remainingFraction!;
+      }
+      if (typeof bucket.resetTime === "string" && bucket.resetTime.length > 0) {
+        if (!earliestReset || bucket.resetTime < earliestReset) {
+          earliestReset = bucket.resetTime;
+        }
+      }
+    }
+    fiveHourWindow = {
+      kind: "five-hour",
+      label: "Five-hour limit",
+      usedPercent: clampUsedPercent(minRemaining),
+      resetsAt: earliestReset,
+    };
+  }
+
+  // 2. Check retrieveUserQuotaSummary for any Gemini-specific windows (e.g. weekly limit).
+  const geminiSummaryGroups = (params.summary?.groups ?? []).filter(
+    (group) => /gemini/iu.test(group.displayName ?? ""),
+  );
+  for (const group of geminiSummaryGroups) {
+    for (const bucket of group.buckets ?? []) {
+      const kind = resolveSummaryBucketKind(bucket);
+      const win: AgyUsageWindow = {
         kind,
-        label: `${prefix}${groupSuffix}`,
-        usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
+        label: kind === "five-hour" ? "Five-hour limit" : "Weekly limit",
+        usedPercent: clampUsedPercent(bucket.remainingFraction),
         resetsAt: typeof bucket.resetTime === "string" ? bucket.resetTime : null,
       };
-    });
-  });
-  if (windows.length === 0) return error("AGY returned no quota windows.");
-  return { supported: true, usage: { status: "ok", accountEmail: email, planLabel: "AGY", windows } };
+      if (kind === "five-hour" && !fiveHourWindow) {
+        fiveHourWindow = win;
+      } else if (kind === "weekly" && !weeklyWindow) {
+        weeklyWindow = win;
+      }
+    }
+  }
+
+  const windows: AgyUsageWindow[] = [];
+  if (fiveHourWindow) windows.push(fiveHourWindow);
+  if (weeklyWindow) windows.push(weeklyWindow);
+
+  if (windows.length === 0) {
+    return error("AGY returned no Gemini quota windows.");
+  }
+
+  return {
+    supported: true,
+    usage: {
+      status: "ok",
+      plan,
+      accountEmail: params.email,
+      planLabel,
+      windows,
+    },
+  };
 }
 
-async function requestQuota(
+async function callCloudCodeApi(
+  endpoint: string,
+  body: Record<string, unknown>,
   accessToken: string,
   fetcher: typeof fetch,
-  quotaUrl?: string,
+  apiBase?: string,
 ): Promise<Response> {
-  const url = quotaUrl ?? process.env.AGY_QUOTA_URL ?? process.env.ANTIGRAVITY_QUOTA_URL ?? DEFAULT_QUOTA_URL;
+  const base = apiBase ?? process.env.AGY_API_BASE ?? DEFAULT_API_BASE;
+  const primaryUrl = `${base}/v1internal:${endpoint}`;
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+  };
+  const payload = JSON.stringify(body);
   try {
-    const res = await fetcher(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-      },
-      body: JSON.stringify({ project: "aicode-consumers" }),
-    });
-    if (res.ok || res.status === 401 || res.status === 403 || url !== DEFAULT_QUOTA_URL) {
+    const res = await fetcher(primaryUrl, { method: "POST", headers, body: payload });
+    if (res.ok || res.status === 401 || res.status === 403 || base !== DEFAULT_API_BASE) {
       return res;
     }
   } catch (cause) {
-    if (url !== DEFAULT_QUOTA_URL) throw cause;
+    if (base !== DEFAULT_API_BASE) throw cause;
   }
 
-  return fetcher(FALLBACK_QUOTA_URL, {
+  return fetcher(`${FALLBACK_API_BASE}/v1internal:${endpoint}`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      "User-Agent": USER_AGENT,
-    },
-    body: JSON.stringify({ project: "aicode-consumers" }),
+    headers,
+    body: payload,
   });
 }
 
@@ -294,7 +402,6 @@ async function refreshedAccessToken(refreshToken: string, fetcher: typeof fetch)
   return typeof body.access_token === "string" ? body.access_token : null;
 }
 
-/** Returns true if the stored token's expiry is in the past or within 60 s. */
 function isTokenExpired(stored: StoredToken): boolean {
   const expiry = stored.token?.expiry;
   if (!expiry) return false;
@@ -308,11 +415,6 @@ function isTokenExpired(stored: StoredToken): boolean {
   }
 }
 
-/**
- * Invoke the lightweight `agy models` command with a short timeout so the
- * AGY CLI can refresh its OAuth token transparently. Falls back to common
- * installation paths when the host daemon has a minimal PATH.
- */
 async function refreshViaAgyCli(agyCli?: string): Promise<void> {
   if (!agyCli) return;
   const { execFile } = await import("node:child_process");
@@ -351,7 +453,7 @@ export async function readAgyUsage(options: {
   readKeyring?: () => Promise<StoredToken | null>;
   fetcher?: typeof fetch;
   agyCli?: string;
-  quotaUrl?: string;
+  apiBase?: string;
 } = {}): Promise<AgyUsageResult> {
   const paths = options.tokenPaths
     ?? (options.tokenPath ? [options.tokenPath] : defaultTokenPaths());
@@ -399,10 +501,42 @@ export async function readAgyUsage(options: {
     } catch { /* ignore, proceed with existing token */ }
   }
 
-  try {
-    let response = await requestQuota(accessToken, fetcher, options.quotaUrl);
+  async function fetchAll(token: string) {
+    const lcaRes = await callCloudCodeApi(
+      "loadCodeAssist",
+      { metadata: { ideType: "ANTIGRAVITY" } },
+      token,
+      fetcher,
+      options.apiBase,
+    );
+    if (lcaRes.status === 401 || lcaRes.status === 403) {
+      return { authError: lcaRes.status as 401 | 403 };
+    }
+    const codeAssist = lcaRes.ok ? (await lcaRes.json() as LoadCodeAssistResponse) : null;
+    const project = resolveProjectId(codeAssist);
 
-    if (response.status === 401) {
+    const [quotaRes, summaryRes] = await Promise.all([
+      callCloudCodeApi("retrieveUserQuota", { project }, token, fetcher, options.apiBase),
+      callCloudCodeApi("retrieveUserQuotaSummary", { project }, token, fetcher, options.apiBase)
+        .catch(() => null),
+    ]);
+
+    if (quotaRes.status === 401 || quotaRes.status === 403) {
+      return { authError: quotaRes.status as 401 | 403 };
+    }
+    if (!quotaRes.ok) {
+      return { httpError: quotaRes.status };
+    }
+
+    const quota = await quotaRes.json() as UserQuotaResponse;
+    const summary = summaryRes?.ok ? (await summaryRes.json() as QuotaSummaryResponse) : null;
+    return { codeAssist, quota, summary };
+  }
+
+  try {
+    let data = await fetchAll(accessToken);
+
+    if ("authError" in data && data.authError === 401) {
       let refreshedToken: string | null = null;
       if (stored.token?.refresh_token) {
         refreshedToken = await refreshedAccessToken(stored.token.refresh_token, fetcher);
@@ -415,14 +549,22 @@ export async function readAgyUsage(options: {
         } catch { /* ignore */ }
       }
       if (!refreshedToken) return { supported: true, usage: { status: "expired" } };
-      response = await requestQuota(refreshedToken, fetcher, options.quotaUrl);
+      data = await fetchAll(refreshedToken);
     }
 
-    if (response.status === 401 || response.status === 403) {
+    if ("authError" in data) {
       return { supported: true, usage: { status: "expired" } };
     }
-    if (!response.ok) return error(`AGY quota request failed (HTTP ${response.status}).`);
-    return normalizeAgyUsage(await response.json() as QuotaSummary, accountEmail(stored));
+    if ("httpError" in data) {
+      return error(`AGY quota request failed (HTTP ${data.httpError}).`);
+    }
+
+    return normalizeAgyUsage({
+      quota: data.quota,
+      summary: data.summary,
+      codeAssist: data.codeAssist,
+      email: accountEmail(stored),
+    });
   } catch (cause) {
     return error(cause instanceof Error ? cause.message : String(cause));
   }
