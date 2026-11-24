@@ -1,14 +1,14 @@
 {
-  "name": "bb-antigravity-usage",
-  "version": "0.1.7",
+  "name": "bb-agy-usage",
+  "version": "0.1.0",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
     "bbPluginSdk": ">=0.4.87"
   },
   "bb": {
-    "name": "Antigravity Usage",
-    "description": "Shows local Antigravity quota usage in BB's Provider Usage panel.",
+    "name": "BB AGY Usage",
+    "description": "Shows local AGY (Antigravity) quota usage in BB's Provider Usage panel with automatic file and OS keyring fallback.",
     "branding": {
       "icon": "ChartColumn"
     },
@@ -20,7 +20,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.6.49",
+    "@get-bb/plugin-sdk": "0.6.157",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.3.0",

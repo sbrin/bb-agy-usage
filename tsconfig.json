@@ -19,7 +19,7 @@
     "server.ts",
     "host.ts",
     "usage-host-contract.ts",
-    "antigravity-usage.ts",
-    "antigravity-usage.test.ts"
+    "agy-usage.ts",
+    "agy-usage.test.ts"
   ]
 }
